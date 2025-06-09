@@ -1,6 +1,21 @@
-FROM alpine:latest as TransmissionUIs
+ARG ALPINE_VERSION="3.12"
 
-RUN apk --no-cache add curl jq \
+FROM alpine:${ALPINE_VERSION} AS PrivoxyBuilder
+WORKDIR /tmp/privoxy
+
+RUN echo "Build Privoxy" \
+    && apk --no-cache add curl bash brotli-dev autoconf build-base libc-utils pkgconf lzip zlib-dev pcre-dev mbedtls-dev w3m \
+    && addgroup -S privoxy && adduser -S privoxy -G privoxy \
+    && curl -sL https://www.privoxy.org/sf-download-mirror/Sources/3.0.29%20%28stable%29/privoxy-3.0.29-stable-src.tar.gz | tar -C . --strip-components=2 -xz \
+    && autoheader \
+    && autoconf \
+    && ./configure --enable-compression --with-brotli  --with-mbedtls --enable-extended-statistics  \
+    && make -j4 \
+    && make install-strip
+
+FROM alpine:${ALPINE_VERSION} as TransmissionUIs
+
+RUN apk --no-cache add curl jq wget \
     && mkdir -p /opt/transmission-ui \
     && echo "Install Shift" \
     && wget -qO- https://github.com/killemov/Shift/archive/master.tar.gz | tar xz -C /opt/transmission-ui \
@@ -19,30 +34,21 @@ RUN apk --no-cache add curl jq \
     && wget -qO- https://github.com/6c65726f79/Transmissionic/releases/download/v1.8.0/Transmissionic-webui-v1.8.0.zip | unzip -q - \
     && mv web /opt/transmission-ui/transmissionic
 
+FROM alpine:${ALPINE_VERSION} as base
 
-FROM ubuntu:22.04 AS base
-
-RUN set -ex; \
-    apt-get update; \
-    apt-get dist-upgrade -y; \
-    apt-get install -y --no-install-recommends \
-      tzdata \
-      iproute2 \
-      net-tools \
-      nano \
-      ca-certificates \
-      curl \
-      libcurl4-openssl-dev \
-      libdeflate-dev \
-      libevent-dev \
-      libfmt-dev \
-      libminiupnpc-dev \
-      libnatpmp-dev \
-      libpsl-dev \
-      libssl-dev \
-      natpmpc
-
-FROM haugene/transmission-builder:4.0.5 as TransmissionBuilder
+RUN echo "@community http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories \
+    && apk --no-cache add bash dumb-init ip6tables openvpn shadow transmission-daemon transmission-cli \
+        wget curl jq tzdata openrc openssh unrar git pcre mbedtls \
+    && apk --no-cache add --force-broken-world ufw@community \
+    && mkdir -p /opt/transmission-ui \
+    && ln -s /usr/share/transmission/web/style /opt/transmission-ui/transmission-web-control \
+    && ln -s /usr/share/transmission/web/images /opt/transmission-ui/transmission-web-control \
+    && ln -s /usr/share/transmission/web/javascript /opt/transmission-ui/transmission-web-control \
+    && ln -s /usr/share/transmission/web/index.html /opt/transmission-ui/transmission-web-control/index.original.html \
+    && rm -rf /tmp/* /var/tmp/* \
+    && groupmod -g 1000 users \
+    && useradd -u 911 -U -d /config -s /bin/false abc \
+    && usermod -G users abc
 
 FROM base
 
@@ -50,45 +56,14 @@ VOLUME /data
 VOLUME /config
 
 COPY --from=TransmissionUIs /opt/transmission-ui /opt/transmission-ui
-COPY --from=TransmissionBuilder /var/tmp/*.deb /var/tmp/
-
-ARG TBT_VERSION=4.0.5
-ARG DEBIAN_FRONTEND=noninteractive
-
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-RUN echo "installing Transmission" && set -x \
-    && if [[ ${TBT_VERSION} =~ ^4 ]]; then \
-      ls -alh /var/tmp/*.deb ;\
-      debfile=$(compgen -G /var/tmp/transmission_*_$(dpkg --print-architecture).deb); \
-      if [[ -n ${debfile} ]]; then \
-      echo "Installing transmission ${TBT_VERSION}" && dpkg -i ${debfile} ;\
-      else echo "No /var/tmp/transmission_*_$(dpkg --print-architecture).deb found. Exiting" \
-      ; exit ; fi ; \
-    else echo "Installing transmission from repository" \
-    && export TBT_VERSION=3.00 \
-    && apt-get install -y --no-install-recommends transmission-daemon transmission-cli; fi
-
-RUN apt-get update && apt-get install -y \
-    dumb-init openvpn privoxy \
-    tzdata dnsutils iputils-ping ufw openssh-client git jq curl wget unrar unzip bc \
-    && ln -s /usr/local/share/transmission/public_html/images /opt/transmission-ui/transmission-web-control \
-    && ln -s /usr/local/share/transmission/public_html/transmission-app.js /opt/transmission-ui/transmission-web-control/transmission-app.js \
-    && ln -s /usr/local/share/transmission/public_html/index.html /opt/transmission-ui/transmission-web-control/index.original.html \
-    && rm -rf /tmp/* /var/tmp/* /var/lib/apt/lists/* \
-    && groupmod -g 1000 users \
-    && useradd -u 911 -U -d /config -s /bin/false abc \
-    && usermod -G users abc
-
+COPY --from=PrivoxyBuilder /usr/local/etc/privoxy /usr/local/etc/privoxy
+COPY --from=PrivoxyBuilder /usr/local/sbin/privoxy /usr/local/sbin/privoxy
 
 # Add configuration and scripts
 ADD openvpn/ /etc/openvpn/
 ADD transmission/ /etc/transmission/
 ADD scripts /etc/scripts/
 ADD privoxy/scripts /opt/privoxy/
-
-# Support legacy IPTables commands
-RUN update-alternatives --set iptables $(which iptables-legacy) && \
-    update-alternatives --set ip6tables $(which ip6tables-legacy)
 
 ENV OPENVPN_USERNAME=**None** \
     OPENVPN_PASSWORD=**None** \
